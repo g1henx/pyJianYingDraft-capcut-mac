@@ -1,3 +1,27 @@
+# CapCut para macOS (fork `capcut-mac`)
+
+Este fork añade `pyJianYingDraft.capcut_mac`, que edita proyectos de **CapCut internacional en macOS** (probado con CapCut 9.4, `draft_info.json` versión 360000 / 185.0.0), que guarda los proyectos en `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<proyecto>/draft_info.json` como JSON sin cifrar.
+
+```python
+import pyJianYingDraft as draft
+
+project = draft.duplicate_draft("Mi proyecto", "Mi proyecto broll")   # o draft.CapCutMacDraft.open("Mi proyecto")
+clip = project.import_media("/ruta/broll.mp4")                       # CapCut está en sandbox: copia el clip dentro del proyecto
+project.script.append_track(draft.TrackSpec(draft.TrackType.video, "broll"))
+seg = draft.VideoSegment(clip, draft.trange("3s", "3s"))
+seg.add_keyframe(draft.KeyframeProperty.uniform_scale, "0s", 1.0).add_keyframe(draft.KeyframeProperty.uniform_scale, "3s", 1.15)
+project.script.add_segment(seg, "broll")
+project.save()                                                        # CapCut debe estar cerrado
+```
+
+Qué resuelve respecto a la versión original:
+- lee/escribe `draft_info.json` y su copia en `Timelines/<id>/`, con copia de seguridad `*.pyjy-<fecha>.bak`;
+- CapCut ordena las capas por la posición de la pista en `tracks`, no por `render_index`: las pistas de vídeo nuevas se insertan justo encima de la pista principal (`new_video_tracks="above_main"`), así los subtítulos y overlays quedan por encima del b-roll;
+- completa segmentos y materiales nuevos con los campos que escribe CapCut (`assets/capcut_mac_defaults.json`, regenerable con `tools/capture_capcut_defaults.py`) y enlaza los materiales auxiliares que CapCut espera;
+- `duplicate_draft` registra la copia en `root_meta_info.json` con un `draft_id` nuevo.
+
+Limitaciones: las animaciones/transiciones/efectos de la librería usan IDs del catálogo de Jianying y puede que CapCut internacional no las encuentre (los keyframes sí funcionan). La exportación sigue siendo manual. Ejemplo por lotes: `examples/capcut_mac_broll.py`.
+
 <!-- PYPI:BEGIN -->
 # pyJianYingDraft
 ### 轻量、灵活、易上手的Python剪映草稿生成及导出工具，构建全自动视频剪辑/混剪流水线！

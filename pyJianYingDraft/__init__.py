@@ -12,6 +12,7 @@ from .metadata import FilterType, FontType, GroupAnimationType, IntroType, MaskT
 from .metadata import TextIntro, TextLoopAnim, TextOutro, TransitionType
 from .metadata import VideoCharacterEffectType, VideoSceneEffectType
 from .script_file import ScriptFile
+from .capcut_mac import CapCutMacDraft, duplicate_draft, list_drafts
 from .template_mode import ExtendMode, ShrinkMode
 from .text_segment import TextBackground, TextBorder, TextSegment, TextShadow, TextStyle
 from .time_util import SEC, Timerange, tim, trange
@@ -24,6 +25,9 @@ if ISWIN:
 
 
 __all__ = [
+    "CapCutMacDraft",
+    "duplicate_draft",
+    "list_drafts",
     "FontType",
     "MaskType",
     "FilterType",
