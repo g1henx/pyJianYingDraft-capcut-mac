@@ -26,9 +26,10 @@ import subprocess
 import time
 import uuid
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import assets
+from .capcut_assets import attach as _attach_asset
 from .script_file import ScriptFile
 
 DEFAULT_DRAFTS_ROOT = os.path.expanduser("~/Movies/CapCut/User Data/Projects/com.lveditor.draft")
@@ -83,6 +84,7 @@ class CapCutMacDraft:
             self._original = json.load(f)
         self.script = ScriptFile._load_template(self.info_path)
         self._defaults = _load_defaults()
+        self._pending_assets: List[Tuple[str, Dict[str, Any], Optional[int]]] = []
 
     @classmethod
     def open(cls, draft_name: str, root: str = DEFAULT_DRAFTS_ROOT) -> "CapCutMacDraft":
@@ -113,6 +115,46 @@ class CapCutMacDraft:
                     m["path"] = new_path
                     changed += 1
         return changed
+
+    def segments(self, track_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Existing segments as {id, track_index, track_type, start, end, text} (seconds), for picking targets"""
+        by_id = {m["id"]: m for items in self._original["materials"].values() if isinstance(items, list)
+                 for m in items if isinstance(m, dict) and "id" in m}
+        out = []
+        for idx, track in enumerate(self._original["tracks"]):
+            if track_type and track["type"] != track_type:
+                continue
+            for seg in track["segments"]:
+                tr = seg["target_timerange"]
+                text = ""
+                mat = by_id.get(seg.get("material_id"), {})
+                if isinstance(mat.get("content"), str):
+                    try:
+                        text = json.loads(mat["content"]).get("text", "")
+                    except ValueError:
+                        pass
+                out.append({"id": seg["id"], "track_index": idx, "track_type": track["type"],
+                            "start": tr["start"] / 1e6, "end": (tr["start"] + tr["duration"]) / 1e6,
+                            "material": mat.get("name") or os.path.basename(mat.get("path", "")), "text": text})
+        return out
+
+    def segment_at(self, seconds: float, track_type: str = "video", track_index: Optional[int] = None) -> str:
+        """Id of the segment covering `seconds` (main video track by default)"""
+        hits = [s for s in self.segments(track_type) if s["start"] <= seconds < s["end"]
+                and (track_index is None or s["track_index"] == track_index)]
+        if not hits:
+            raise LookupError(f"no {track_type} segment at {seconds}s")
+        return min(hits, key=lambda s: s["track_index"])["id"]
+
+    def attach_asset(self, asset: Dict[str, Any], segment_id: str, duration: Optional[float] = None) -> None:
+        """Attach an asset from `AssetIndex` (transition, animation, text effect, mask...) to a segment.
+
+        `segment_id` is an existing segment id (see `segments()`/`segment_at()`) or
+        the `segment_id` of a segment added through `script`. Transitions go on the
+        clip BEFORE the cut. `duration` (seconds) overrides the asset's default.
+        Applied when saving.
+        """
+        self._pending_assets.append((segment_id, asset, None if duration is None else int(round(duration * 1e6))))
 
     # ------------------------------------------------------------------ saving
 
@@ -181,6 +223,13 @@ class CapCutMacDraft:
                 if track["type"] == "video":
                     self._complete_video_segment(seg, data["materials"], new_ids)
 
+        segments_by_id = {seg["id"]: seg for t in tracks for seg in t["segments"]}
+        for seg_id, asset, duration_us in self._pending_assets:
+            seg = segments_by_id.get(seg_id) or segments_by_id.get(seg_id.replace("-", "").lower())
+            if seg is None:
+                raise KeyError(f"segment {seg_id} not found in draft")
+            _attach_asset(data, seg, asset, duration_us)
+
         for items in data["materials"].values():
             if not isinstance(items, list):
                 continue
@@ -220,8 +269,10 @@ class CapCutMacDraft:
 
     @staticmethod
     def _warn_catalogue_resources(data: Dict[str, Any], new_ids: Set[str]) -> None:
+        # materials copied from CapCut projects (asset index) carry a CapCut cache path; library ones do not
         kinds = ["material_animations", "transitions", "video_effects", "effects", "filters"]
-        used = [k for k in kinds for m in data["materials"].get(k, []) if m.get("id") in new_ids]
+        used = [k for k in kinds for m in data["materials"].get(k, []) if m.get("id") in new_ids
+                and not all(a.get("path") for a in m.get("animations", [m]))]
         if used:
             print(f"[capcut_mac] warning: new {sorted(set(used))} use Jianying resource ids; "
                   "CapCut international may not find them. Keyframes are safe.")
@@ -256,6 +307,7 @@ class CapCutMacDraft:
                 json.dump(meta, f, ensure_ascii=False, separators=(",", ":"))
 
         self._original = data
+        self._pending_assets = []
         return suffix if backup else ""
 
 

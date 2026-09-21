@@ -20,7 +20,21 @@ Qué resuelve respecto a la versión original:
 - completa segmentos y materiales nuevos con los campos que escribe CapCut (`assets/capcut_mac_defaults.json`, regenerable con `tools/capture_capcut_defaults.py`) y enlaza los materiales auxiliares que CapCut espera;
 - `duplicate_draft` registra la copia en `root_meta_info.json` con un `draft_id` nuevo.
 
-Limitaciones: las animaciones/transiciones/efectos de la librería usan IDs del catálogo de Jianying y puede que CapCut internacional no las encuentre (los keyframes sí funcionan). La exportación sigue siendo manual. Ejemplo por lotes: `examples/capcut_mac_broll.py`.
+### Índice de assets de CapCut (efectos, plantillas de subtítulos, transiciones...)
+
+`tools/build_capcut_asset_index.py <carpeta>` recorre todos tus proyectos (incluidos timelines extra y clips compuestos) y genera `capcut_assets.json` + `CAPCUT_ASSETS.md`: cada asset con su nombre (o uno descriptivo si CapCut no lo guarda), traducción al español de los nombres chinos (`tools/capcut_glossary_es.json`), `resource_id`, usos, proyectos, si está en caché, cómo se enlaza en el JSON y el material listo para copiar.
+
+```python
+assets = draft.AssetIndex()                       # ~/Documents/Fix-Videos/capcut_asset_index/capcut_assets.json (o $CAPCUT_ASSET_INDEX)
+project = draft.CapCutMacDraft.open("Mi proyecto")
+project.attach_asset(assets.get("Pull in"), project.segment_at(2.0))                 # transición en el corte siguiente
+project.attach_asset(assets.get("Unfold", kind="animation_in"), project.segment_at(4.0, "video", 1))
+project.save()
+```
+
+`attach_asset` cubre transiciones, animaciones (entrada/salida/bucle/subtítulo), efectos/brillo/burbuja de texto, máscaras, filtros de voz, ajustes y herramientas de color. Plantillas de subtítulos, efectos de vídeo, filtros y stickers necesitan su propia pista y de momento solo están documentados en el índice.
+
+Limitaciones: las animaciones/transiciones/efectos del catálogo propio de la librería usan IDs de Jianying (usa los del índice en su lugar) y puede que CapCut internacional no las encuentre (los keyframes sí funcionan). La exportación sigue siendo manual. Ejemplo por lotes: `examples/capcut_mac_broll.py`.
 
 <!-- PYPI:BEGIN -->
 # pyJianYingDraft
