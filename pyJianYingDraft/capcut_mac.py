@@ -29,7 +29,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import assets
-from .capcut_assets import TRACK_KINDS, TRACK_TYPES, build_caption, build_track_segment
+from .capcut_assets import TRACK_KINDS, TRACK_TYPES, build_caption, build_sound_segment, build_text_segment, build_track_segment
 from .capcut_assets import attach as _attach_asset
 from .script_file import ScriptFile
 
@@ -65,6 +65,17 @@ def _fill(target: Dict[str, Any], defaults: Dict[str, Any]) -> None:
             _fill(target[key], value)
 
 
+def _media_duration_us(path: str) -> Optional[int]:
+    """Duration of a media file in microseconds, via ffprobe; None if it cannot be read"""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", path],
+                             capture_output=True, text=True, timeout=20)
+        return int(round(float(out.stdout.strip()) * 1e6))
+    except Exception:
+        return None
+
+
 def _new_uuid() -> str:
     return str(uuid.uuid4()).upper()
 
@@ -88,6 +99,7 @@ class CapCutMacDraft:
         self._pending_assets: List[Tuple[str, Dict[str, Any], Optional[int]]] = []
         self._pending_tracks: List[Dict[str, Any]] = []
         self._removed_tracks: Set[str] = set()
+        self._new_media: List[Tuple[str, str]] = []
 
     @classmethod
     def open(cls, draft_name: str, root: str = DEFAULT_DRAFTS_ROOT) -> "CapCutMacDraft":
@@ -228,6 +240,43 @@ class CapCutMacDraft:
                                              int(round(duration * 1e6)), x=x, y=y, scale=scale, intensity=intensity)
         return self._queue_segment(kind, materials, seg)
 
+    def add_text(self, text: str, start: float, duration: float, *, y: float = -0.56, x: float = 0.0,
+                 size: float = 15.0, font: Any = None, highlight: Optional[List[str]] = None,
+                 highlight_font: Any = None, highlight_size: Optional[float] = None,
+                 color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+                 highlight_color: Tuple[float, float, float] = (1.0, 0.85, 0.2),
+                 stroke: float = 0.06, scale: float = 1.0) -> str:
+        """Add a plain CapCut text box (the "Text" tool, not a caption template). Returns the segment id.
+
+        This is the path that works today: caption templates written by script are
+        not drawn by CapCut. `font` and `highlight_font` take a font asset from
+        `AssetIndex` or a path to a .ttf/.otf; the words listed in `highlight` are
+        drawn with the second font, colour and size. `y` = -0.56 is chest height.
+        """
+        materials, seg = build_text_segment(
+            self._defaults["segments"]["text"], self._defaults["materials"]["text"], text,
+            int(round(start * 1e6)), int(round(duration * 1e6)), font=font, highlight=highlight,
+            highlight_font=highlight_font, color=color, highlight_color=highlight_color, size=size,
+            highlight_size=highlight_size, stroke=stroke, y=y, x=x, scale=scale)
+        return self._queue_segment("text", materials, seg)
+
+    def add_sound_effect(self, path: str, start: float, duration: float, *, source_start: float = 0.0,
+                         volume: float = 1.0) -> str:
+        """Add a local audio file (sound effect) on its own audio track. Returns the segment id.
+
+        `start` is where it sounds in the timeline, `duration` how long, and
+        `source_start` where the cut starts inside the file (all in seconds).
+        `volume` 1.0 is the file's own level. Overlapping effects open a new
+        audio track automatically; existing audio is left untouched.
+        """
+        materials, seg = build_sound_segment(
+            path, self._defaults["segments"]["sound"], self._defaults["materials"]["audio"],
+            self._defaults["audio_aux"], int(round(start * 1e6)), int(round(duration * 1e6)),
+            source_start_us=int(round(source_start * 1e6)), volume=volume,
+            file_duration_us=_media_duration_us(path))
+        self._new_media.append(("music", path))
+        return self._queue_segment("sound", materials, seg)
+
     def add_asset(self, asset: Dict[str, Any], start: float, duration: float, **kwargs: Any) -> str:
         """Dispatch to `add_caption` (needs text=...) or `add_track_asset` by asset kind"""
         if asset["kind"] == "text_template":
@@ -251,7 +300,7 @@ class CapCutMacDraft:
         tracks = data["tracks"]
         ri = {"caption": max([s["render_index"] for t in tracks if t["type"] in ("text", "sticker")
                               for s in t["segments"]] + [_TEXT_RENDER_BASE - 1]) + 1}
-        ri["sticker"] = ri["caption"]
+        ri["sticker"] = ri["text"] = ri["caption"]
         low, top = [], []
         for pending in self._pending_tracks:
             kind = pending["kind"]
@@ -261,14 +310,19 @@ class CapCutMacDraft:
             if kind in ri:
                 for sg in segs:
                     sg["render_index"] = ri[kind]
-                ri["caption"] = ri["sticker"] = ri[kind] + 1
+                ri["caption"] = ri["sticker"] = ri["text"] = ri[kind] + 1
             track = {**deepcopy(self._defaults["tracks"][kind]), "id": _new_uuid(), "segments": segs}
             track["type"] = TRACK_TYPES[kind]
             (low if kind in ("video_effect", "filter") else top).append(track)
             data["duration"] = max([data["duration"]] + [sg["target_timerange"]["start"] + sg["target_timerange"]["duration"]
                                                          for sg in segs])
         tracks[above_video_idx:above_video_idx] = low
-        tracks.extend(top)
+        # CapCut keeps the audio tracks last; new visual tracks go before them
+        visual = [t for t in top if t["type"] != "audio"]
+        audio = [t for t in top if t["type"] == "audio"]
+        first_audio = next((i for i, t in enumerate(tracks) if t["type"] == "audio"), len(tracks))
+        tracks[first_audio:first_audio] = visual
+        tracks.extend(audio)
         for idx, t in enumerate(tracks):
             for sg in t["segments"]:
                 sg["track_render_index"] = idx
@@ -434,13 +488,35 @@ class CapCutMacDraft:
                 meta = json.load(f)
             meta["tm_duration"] = data["duration"]
             meta["tm_draft_modified"] = int(time.time() * 1e6)
+            self._register_media(meta)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, separators=(",", ":"))
 
         self._original = data
         self._pending_assets = []
         self._pending_tracks = []
+        self._new_media = []
         return suffix if backup else ""
+
+    def _register_media(self, meta: Dict[str, Any]) -> None:
+        """List new media files in draft_meta_info.json, the way CapCut does when importing"""
+        bucket = next((b for b in meta.get("draft_materials", []) if b.get("type") == 0), None)
+        if bucket is None:
+            return
+        known = {v.get("file_Path") for v in bucket.setdefault("value", [])}
+        now = int(time.time())
+        for metetype, path in self._new_media:
+            if path in known:
+                continue
+            known.add(path)
+            duration = _media_duration_us(path) or 0
+            bucket["value"].append({
+                "ai_group_type": "", "create_time": now, "duration": duration, "enter_from": 0,
+                "extra_info": os.path.basename(path), "file_Path": path, "height": 0,
+                "id": str(uuid.uuid4()).lower(), "import_time": now, "import_time_ms": now * 1000000,
+                "item_source": 1, "material_color_tag": "", "md5": "", "metetype": metetype,
+                "roughcut_time_range": {"duration": duration, "start": 0},
+                "sub_time_range": {"duration": -1, "start": -1}, "type": 0, "width": 0})
 
 
 def list_drafts(root: str = DEFAULT_DRAFTS_ROOT) -> List[str]:

@@ -42,7 +42,29 @@ project.script.add_segment(draft.VideoSegment(ruta, draft.trange("0s", "4s"),
                                               source_timerange=draft.trange("10s", "4s")), "main")
 ```
 
-Subtítulos con plantilla (`project.add_caption(...)`): escriben una estructura idéntica a la de CapCut, pero **CapCut no los dibuja todavía** (fallo abierto). Efectos de vídeo, filtros y stickers (`add_track_asset`) sí están verificados en la app.
+### Texto y subtítulos (`add_text`, verificado en la app)
+
+Escribe cajas de texto de CapCut (la herramienta **Text**), con la opción de dar a unas palabras otra fuente, otro color y otro tamaño dentro de la misma frase: un texto de CapCut guarda tramos de estilo por rango de caracteres.
+
+```python
+project.add_text("Nadie te lo dice", 0.0, 0.633, y=-0.56, size=15.0,
+                 font=assets.get("Inter Black", kind="font"),
+                 highlight=["Nadie"], highlight_size=17.0,
+                 highlight_color=(1.0, 0.82, 0.16),
+                 highlight_font="/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf")
+```
+
+`font`/`highlight_font` aceptan un asset de fuente del índice o la ruta de un `.ttf`/`.otf`; CapCut carga las dos (su caché y rutas del sistema). Ejemplo: `examples/capcut_mac_captions.py`.
+
+Los subtítulos con **plantilla** (`add_caption`) escriben una estructura idéntica a la de CapCut, pero **CapCut no los dibuja todavía** (fallo abierto): usa `add_text`. Efectos de vídeo, filtros y stickers (`add_track_asset`) sí están verificados en la app.
+
+### Efectos de sonido (`add_sound_effect`)
+
+```python
+project.add_sound_effect(ruta_mp3, 0.867, 0.467, source_start=1.033, volume=1.0)
+```
+
+Crea su propia pista de audio (otra más si dos efectos se solapan), no toca el audio existente y registra el archivo en `draft_meta_info.json` como hace CapCut al importar. `tools/apply_sfx.py "<proyecto>"` aplica una receta de SFX disparada por assets concretos (una transición o una animación de entrada determinadas), con su posición y recorte relativos.
 
 `attach_asset` cubre transiciones, animaciones (entrada/salida/bucle/subtítulo), efectos/brillo/burbuja de texto, máscaras, filtros de voz, ajustes y herramientas de color. Plantillas de subtítulos, efectos de vídeo, filtros y stickers necesitan su propia pista y de momento solo están documentados en el índice.
 

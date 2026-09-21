@@ -15,12 +15,13 @@ Caption templates, video effects, filters and stickers need their own track
 segments and are not attached by this helper (see the index notes).
 """
 
+import hashlib
 import json
 import os
 import re
 import uuid
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_INDEX = os.environ.get(
     "CAPCUT_ASSET_INDEX", os.path.expanduser("~/Documents/Fix-Videos/capcut_asset_index/capcut_assets.json"))
@@ -156,7 +157,8 @@ def attach(data: Dict[str, Any], segment: Dict[str, Any], asset: Dict[str, Any],
 # own tracks. These builders return (materials to add as [(list, material)], segment).
 
 TRACK_KINDS = {"text_template": "caption", "video_effect": "video_effect", "filter": "filter", "sticker": "sticker"}
-TRACK_TYPES = {"caption": "text", "video_effect": "effect", "filter": "filter", "sticker": "sticker"}
+TRACK_TYPES = {"caption": "text", "video_effect": "effect", "filter": "filter", "sticker": "sticker",
+               "sound": "audio", "text": "text"}
 MATERIAL_LISTS = {"video_effect": "video_effects", "filter": "effects", "sticker": "stickers"}
 
 
@@ -283,3 +285,123 @@ def build_track_segment(asset: Dict[str, Any], segment_template: Dict[str, Any],
         if scale is not None:
             seg["clip"]["scale"] = {"x": scale, "y": scale}
     return [(MATERIAL_LISTS[kind], material)], seg
+
+
+def build_sound_segment(path: str, segment_template: Dict[str, Any], material_template: Dict[str, Any],
+                        aux_templates: Dict[str, Any], start_us: int, duration_us: int, *,
+                        source_start_us: int = 0, volume: float = 1.0,
+                        file_duration_us: Optional[int] = None, name: Optional[str] = None):
+    """Segment + materials for a local audio file (sound effect) on its own audio track"""
+    material = deepcopy(material_template)
+    material["id"] = str(uuid.uuid4()).upper()
+    material["name"] = name or os.path.basename(path)
+    material["path"] = path
+    material["type"] = "extract_music"
+    material["category_name"] = "local"
+    material["unique_id"] = hashlib.md5(path.encode("utf-8")).hexdigest()
+    material["duration"] = int(file_duration_us or (source_start_us + duration_us))
+
+    seg = deepcopy(segment_template)
+    seg["id"] = str(uuid.uuid4()).upper()
+    seg["material_id"] = material["id"]
+    seg["target_timerange"] = {"start": start_us, "duration": duration_us}
+    seg["source_timerange"] = {"start": source_start_us, "duration": duration_us}
+    seg["volume"] = volume
+    seg["last_nonzero_volume"] = volume or 1.0
+    seg["extra_material_refs"] = []
+
+    materials = [("audios", material)]
+    for mlist, template in aux_templates.items():
+        aux = deepcopy(template)
+        aux["id"] = str(uuid.uuid4()).upper()
+        materials.append((mlist, aux))
+        seg["extra_material_refs"].append(aux["id"])
+    return materials, seg
+
+
+def _font_spec(font: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalise a font given as an `AssetIndex` asset, a {path,id,title} dict or a plain path"""
+    if font is None:
+        return {}
+    if isinstance(font, str):
+        return {"path": font, "id": "", "title": os.path.splitext(os.path.basename(font))[0]}
+    template = font.get("template", font)
+    return {"path": template.get("path", ""),
+            "id": str(template.get("resource_id") or font.get("resource_id") or ""),
+            "title": font.get("display_name") or font.get("name") or template.get("title", "")}
+
+
+def _style_ranges(text: str, highlight: Optional[List[str]]) -> List[Tuple[int, int, bool]]:
+    """[(start, end, is_highlight)] covering `text`, marking the words listed in `highlight`"""
+    if not highlight:
+        return [(0, len(text), False)]
+    marks = [False] * len(text)
+    lowered = text.lower()
+    for word in highlight:
+        at, needle = 0, word.lower()
+        while True:
+            at = lowered.find(needle, at)
+            if at < 0:
+                break
+            for i in range(at, at + len(needle)):
+                marks[i] = True
+            at += len(needle)
+    spans, start = [], 0
+    for i in range(1, len(text) + 1):
+        if i == len(text) or marks[i] != marks[start]:
+            spans.append((start, i, marks[start]))
+            start = i
+    return spans
+
+
+def build_text_segment(segment_template: Dict[str, Any], material_template: Dict[str, Any], text: str,
+                       start_us: int, duration_us: int, *, font: Any = None, highlight: Optional[List[str]] = None,
+                       highlight_font: Any = None, color=(1.0, 1.0, 1.0), highlight_color=(1.0, 0.85, 0.2),
+                       size: float = 15.0, highlight_size: Optional[float] = None, stroke: float = 0.06,
+                       y: float = -0.56, x: float = 0.0, scale: float = 1.0):
+    """Segment + material for a plain CapCut text box, optionally with some words in a second font"""
+    base = _font_spec(font)
+    accent = _font_spec(highlight_font) or base
+    styles = []
+    for begin, end, marked in _style_ranges(text, highlight):
+        spec = accent if marked else base
+        rgb = highlight_color if marked else color
+        style: Dict[str, Any] = {
+            "fill": {"content": {"solid": {"color": list(rgb)}, "render_type": "solid"}},
+            "range": [begin, end],
+            "size": (highlight_size or size) if marked else size,
+            "useLetterColor": True,
+        }
+        if stroke:
+            style["strokes"] = [{"width": stroke, "content": {"solid": {"color": [0, 0, 0]},
+                                                              "render_type": "solid"}}]
+        if spec.get("path"):
+            style["font"] = {"path": spec["path"], "id": spec.get("id", "")}
+        styles.append(style)
+
+    material = deepcopy(material_template)
+    material["id"] = str(uuid.uuid4()).upper()
+    material["content"] = json.dumps({"styles": styles, "text": text}, ensure_ascii=False)
+    material["font_size"] = size
+    material["border_width"] = stroke
+    if base.get("path"):
+        material["font_path"] = base["path"]
+        material["font_resource_id"] = base.get("id", "")
+        material["font_source_platform"] = 1 if base.get("id") else 0
+    material["fonts"] = [{"category_id": "", "category_name": "", "effect_id": spec.get("id", ""),
+                          "file_uri": "", "id": str(uuid.uuid4()).upper(), "path": spec["path"],
+                          "request_id": "", "resource_id": spec.get("id", ""), "source_platform": 1,
+                          "team_id": "", "third_resource_id": "", "title": spec.get("title", "")}
+                         for spec in ({s["path"]: s for s in (base, accent) if s.get("path")}).values()]
+
+    seg = deepcopy(segment_template)
+    seg["id"] = str(uuid.uuid4()).upper()
+    seg["material_id"] = material["id"]
+    seg["target_timerange"] = {"start": start_us, "duration": duration_us}
+    if isinstance(seg.get("clip"), dict):
+        seg["clip"]["transform"] = {"x": x, "y": y}
+        seg["clip"]["scale"] = {"x": scale, "y": scale}
+    animations = {"id": str(uuid.uuid4()).upper(), "type": "sticker_animation",
+                  "animations": [], "multi_language_current": "none"}
+    seg["extra_material_refs"] = [animations["id"]]
+    return [("texts", material), ("material_animations", animations)], seg
