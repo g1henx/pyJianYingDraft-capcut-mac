@@ -32,6 +32,18 @@ project.attach_asset(assets.get("Unfold", kind="animation_in"), project.segment_
 project.save()
 ```
 
+Para rehacer un montaje con cortes (la pista principal es un tramo del archivo original por cada corte):
+
+```python
+ruta = project.segments("video")[0]["path"]
+project.remove_track(project.main_track_id())          # fuera el montaje en bruto
+project.script.append_track(draft.TrackSpec(draft.TrackType.video, "main"))
+project.script.add_segment(draft.VideoSegment(ruta, draft.trange("0s", "4s"),
+                                              source_timerange=draft.trange("10s", "4s")), "main")
+```
+
+Subtítulos con plantilla (`project.add_caption(...)`): escriben una estructura idéntica a la de CapCut, pero **CapCut no los dibuja todavía** (fallo abierto). Efectos de vídeo, filtros y stickers (`add_track_asset`) sí están verificados en la app.
+
 `attach_asset` cubre transiciones, animaciones (entrada/salida/bucle/subtítulo), efectos/brillo/burbuja de texto, máscaras, filtros de voz, ajustes y herramientas de color. Plantillas de subtítulos, efectos de vídeo, filtros y stickers necesitan su propia pista y de momento solo están documentados en el índice.
 
 Limitaciones: las animaciones/transiciones/efectos del catálogo propio de la librería usan IDs de Jianying (usa los del índice en su lugar) y puede que CapCut internacional no las encuentre (los keyframes sí funcionan). La exportación sigue siendo manual. Ejemplo por lotes: `examples/capcut_mac_broll.py`.

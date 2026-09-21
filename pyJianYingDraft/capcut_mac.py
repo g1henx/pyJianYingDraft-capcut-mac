@@ -29,6 +29,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import assets
+from .capcut_assets import TRACK_KINDS, TRACK_TYPES, build_caption, build_track_segment
 from .capcut_assets import attach as _attach_asset
 from .script_file import ScriptFile
 
@@ -85,6 +86,8 @@ class CapCutMacDraft:
         self.script = ScriptFile._load_template(self.info_path)
         self._defaults = _load_defaults()
         self._pending_assets: List[Tuple[str, Dict[str, Any], Optional[int]]] = []
+        self._pending_tracks: List[Dict[str, Any]] = []
+        self._removed_tracks: Set[str] = set()
 
     @classmethod
     def open(cls, draft_name: str, root: str = DEFAULT_DRAFTS_ROOT) -> "CapCutMacDraft":
@@ -122,7 +125,7 @@ class CapCutMacDraft:
                  for m in items if isinstance(m, dict) and "id" in m}
         out = []
         for idx, track in enumerate(self._original["tracks"]):
-            if track_type and track["type"] != track_type:
+            if (track_type and track["type"] != track_type) or track["id"] in self._removed_tracks:
                 continue
             for seg in track["segments"]:
                 tr = seg["target_timerange"]
@@ -133,9 +136,23 @@ class CapCutMacDraft:
                         text = json.loads(mat["content"]).get("text", "")
                     except ValueError:
                         pass
+                source = seg.get("source_timerange") or {}
                 out.append({"id": seg["id"], "track_index": idx, "track_type": track["type"],
                             "start": tr["start"] / 1e6, "end": (tr["start"] + tr["duration"]) / 1e6,
-                            "material": mat.get("name") or os.path.basename(mat.get("path", "")), "text": text})
+                            "source_start": source.get("start", 0) / 1e6 if source else None,
+                            "material": mat.get("name") or os.path.basename(mat.get("path", "")),
+                            "path": mat.get("path", ""), "text": text})
+
+        # segments added in this session (they only exist in the draft after save())
+        for offset, track in enumerate(self.script.tracks.values()):
+            if track_type and track.track_type.name != track_type:
+                continue
+            for seg in track.segments:
+                out.append({"id": seg.segment_id, "track_index": len(self._original["tracks"]) + offset,
+                            "track_type": track.track_type.name, "name": track.name,
+                            "start": seg.target_timerange.start / 1e6,
+                            "end": seg.target_timerange.end / 1e6,
+                            "source_start": None, "material": "", "path": "", "text": "", "new": True})
         return out
 
     def segment_at(self, seconds: float, track_type: str = "video", track_index: Optional[int] = None) -> str:
@@ -146,6 +163,29 @@ class CapCutMacDraft:
             raise LookupError(f"no {track_type} segment at {seconds}s")
         return min(hits, key=lambda s: s["track_index"])["id"]
 
+    def main_track_id(self) -> str:
+        """Id of the main video track: the bottom video layer, not an overlay (flag 2)"""
+        track = next((t for t in self._original["tracks"] if t["type"] == "video"
+                      and t.get("flag") != 2 and t["id"] not in self._removed_tracks), None)
+        if track is None:
+            raise LookupError("this draft has no main video track")
+        return track["id"]
+
+    def remove_track(self, track_id: str) -> int:
+        """Drop an existing track (e.g. the raw main track before rebuilding it with cuts).
+
+        Returns how many segments were removed. Its materials stay in the draft;
+        CapCut prunes the unused ones the next time it saves.
+        """
+        self._removed_tracks.add(track_id)
+        keep = [t for t in self.script.imported_tracks if t.track_id != track_id]
+        removed = len(self.script.imported_tracks) - len(keep)
+        if not removed:
+            raise KeyError(f"track {track_id} not found among the draft's own tracks")
+        segments = sum(len(t["segments"]) for t in self._original["tracks"] if t["id"] == track_id)
+        self.script.imported_tracks = keep
+        return segments
+
     def attach_asset(self, asset: Dict[str, Any], segment_id: str, duration: Optional[float] = None) -> None:
         """Attach an asset from `AssetIndex` (transition, animation, text effect, mask...) to a segment.
 
@@ -155,6 +195,83 @@ class CapCutMacDraft:
         Applied when saving.
         """
         self._pending_assets.append((segment_id, asset, None if duration is None else int(round(duration * 1e6))))
+
+    def add_caption(self, template: Dict[str, Any], text: str, start: float, duration: float, *,
+                    words: Optional[List[Tuple[str, float, float]]] = None, y: Optional[float] = None,
+                    scale: Optional[float] = None) -> str:
+        """Add a caption using a caption/text template from `AssetIndex` (e.g. "Rebote de colores 2").
+
+        `start`/`duration` in seconds. `words`: optional [(word, start, end)] in
+        seconds relative to the caption start (e.g. from speech recognition) so
+        word-by-word highlights follow the voice; evenly timed otherwise.
+        `y` moves it vertically (half-canvas units, up is positive). Returns the segment id.
+        """
+        duration_us = int(round(duration * 1e6))
+        word_list = None if words is None else [
+            {"text": w, "start": int(round(a * 1e6)), "end": int(round(b * 1e6))} for w, a, b in words]
+        materials, seg = build_caption(template, self._defaults["segments"]["caption"], text,
+                                       int(round(start * 1e6)), duration_us, word_list, y, scale)
+        return self._queue_segment("caption", materials, seg)
+
+    def add_track_asset(self, asset: Dict[str, Any], start: float, duration: float, *, x: float = 0.0,
+                        y: float = 0.0, scale: Optional[float] = None, intensity: Optional[float] = None) -> str:
+        """Add a video effect, filter or sticker from `AssetIndex` on its own track. Returns the segment id.
+
+        Video effects and filters go right above the main video (and new b-roll)
+        tracks, so they apply to the footage but not to captions or overlays;
+        stickers go on top. `x`/`y`/`scale` position stickers; `intensity` (0-1) sets filter strength.
+        """
+        kind = TRACK_KINDS.get(asset["kind"])
+        if kind not in ("video_effect", "filter", "sticker"):
+            raise ValueError(f"{asset['display_name']} ({asset['kind']}): use add_caption/attach_asset instead")
+        materials, seg = build_track_segment(asset, self._defaults["segments"][kind], int(round(start * 1e6)),
+                                             int(round(duration * 1e6)), x=x, y=y, scale=scale, intensity=intensity)
+        return self._queue_segment(kind, materials, seg)
+
+    def add_asset(self, asset: Dict[str, Any], start: float, duration: float, **kwargs: Any) -> str:
+        """Dispatch to `add_caption` (needs text=...) or `add_track_asset` by asset kind"""
+        if asset["kind"] == "text_template":
+            return self.add_caption(asset, kwargs.pop("text"), start, duration, **kwargs)
+        return self.add_track_asset(asset, start, duration, **kwargs)
+
+    def _queue_segment(self, kind: str, materials: List[Tuple[str, Dict[str, Any]]], seg: Dict[str, Any]) -> str:
+        tr = seg["target_timerange"]
+        begin, end = tr["start"], tr["start"] + tr["duration"]
+        track = next((t for t in self._pending_tracks if t["kind"] == kind and all(
+            end <= o["target_timerange"]["start"] or begin >= o["target_timerange"]["start"] + o["target_timerange"]["duration"]
+            for o in t["segments"])), None)
+        if track is None:
+            track = {"kind": kind, "segments": [], "materials": []}
+            self._pending_tracks.append(track)
+        track["segments"].append(seg)
+        track["materials"] += materials
+        return seg["id"]
+
+    def _insert_pending_tracks(self, data: Dict[str, Any], above_video_idx: int) -> None:
+        tracks = data["tracks"]
+        ri = {"caption": max([s["render_index"] for t in tracks if t["type"] in ("text", "sticker")
+                              for s in t["segments"]] + [_TEXT_RENDER_BASE - 1]) + 1}
+        ri["sticker"] = ri["caption"]
+        low, top = [], []
+        for pending in self._pending_tracks:
+            kind = pending["kind"]
+            for mlist, m in pending["materials"]:
+                data["materials"].setdefault(mlist, []).append(m)
+            segs = sorted(pending["segments"], key=lambda sg: sg["target_timerange"]["start"])
+            if kind in ri:
+                for sg in segs:
+                    sg["render_index"] = ri[kind]
+                ri["caption"] = ri["sticker"] = ri[kind] + 1
+            track = {**deepcopy(self._defaults["tracks"][kind]), "id": _new_uuid(), "segments": segs}
+            track["type"] = TRACK_TYPES[kind]
+            (low if kind in ("video_effect", "filter") else top).append(track)
+            data["duration"] = max([data["duration"]] + [sg["target_timerange"]["start"] + sg["target_timerange"]["duration"]
+                                                         for sg in segs])
+        tracks[above_video_idx:above_video_idx] = low
+        tracks.extend(top)
+        for idx, t in enumerate(tracks):
+            for sg in t["segments"]:
+                sg["track_render_index"] = idx
 
     # ------------------------------------------------------------------ saving
 
@@ -186,8 +303,11 @@ class CapCutMacDraft:
             new_video = [t for t in tracks if t["type"] == "video" and t["id"] not in orig_track_ids]
             new_video_ids = {t["id"] for t in new_video}
             rest = [t for t in tracks if t["id"] not in new_video_ids]
-            main_idx = next((i for i, t in enumerate(rest) if t["type"] == "video"), -1)
-            tracks = rest[:main_idx + 1] + new_video + rest[main_idx + 1:]
+            # the main track is the first video track that is not an overlay (flag 2);
+            # if the draft has none (it was rebuilt with cuts), the new tracks are the base layer
+            main_idx = next((i for i, t in enumerate(rest) if t["type"] == "video" and t.get("flag") != 2), None)
+            at = 0 if main_idx is None else main_idx + 1
+            tracks = rest[:at] + new_video + rest[at:]
             data["tracks"] = tracks
         elif new_video_tracks != "top":
             raise ValueError(f"unknown new_video_tracks mode: {new_video_tracks}")
@@ -204,7 +324,9 @@ class CapCutMacDraft:
                 new_ids.add(track["id"])
                 if track["type"] == "video" and overlay_track is not None:
                     _fill(track, {k: v for k, v in overlay_track.items() if k not in ("id", "segments", "name")})
-                    track["flag"] = overlay_track.get("flag", 2)
+                    # bottom-most video track is the main one, the rest are overlays (flag 2)
+                    is_base = track_idx == next(i for i, t in enumerate(tracks) if t["type"] == "video")
+                    track["flag"] = 0 if is_base else overlay_track.get("flag", 2)
             if track["type"] == "video":
                 video_layer += 1
                 track_ri = video_layer
@@ -222,6 +344,15 @@ class CapCutMacDraft:
                 seg["render_index"] = track_ri
                 if track["type"] == "video":
                     self._complete_video_segment(seg, data["materials"], new_ids)
+
+        base_idx = next((i for i, t in enumerate(tracks) if t["type"] == "video" and t.get("flag") != 2), -1)
+        above_video_idx = base_idx + 1
+        # skip the b-roll stacked straight on the main track, but stay below the overlays
+        while above_video_idx < len(tracks) and tracks[above_video_idx]["type"] == "video" \
+                and (tracks[above_video_idx]["id"] not in orig_track_ids or tracks[above_video_idx].get("flag") != 2):
+            above_video_idx += 1
+        self._insert_pending_tracks(data, above_video_idx)
+        tracks = data["tracks"]
 
         segments_by_id = {seg["id"]: seg for t in tracks for seg in t["segments"]}
         for seg_id, asset, duration_us in self._pending_assets:
@@ -308,6 +439,7 @@ class CapCutMacDraft:
 
         self._original = data
         self._pending_assets = []
+        self._pending_tracks = []
         return suffix if backup else ""
 
 

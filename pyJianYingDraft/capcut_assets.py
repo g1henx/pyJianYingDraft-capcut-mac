@@ -149,3 +149,137 @@ def attach(data: Dict[str, Any], segment: Dict[str, Any], asset: Dict[str, Any],
     materials.setdefault(mlist, []).append(material)
     refs.append(material["id"])
     return material["id"]
+
+
+# ---------------------------------------------------------------- track segments
+# Captions (caption templates), video effects, filters and stickers live on their
+# own tracks. These builders return (materials to add as [(list, material)], segment).
+
+TRACK_KINDS = {"text_template": "caption", "video_effect": "video_effect", "filter": "filter", "sticker": "sticker"}
+TRACK_TYPES = {"caption": "text", "video_effect": "effect", "filter": "filter", "sticker": "sticker"}
+MATERIAL_LISTS = {"video_effect": "video_effects", "filter": "effects", "sticker": "stickers"}
+
+
+def _remap_uuids(obj: Any) -> Any:
+    """Deep copy of `obj` with every UUID consistently replaced by a fresh one"""
+    text = json.dumps(obj, ensure_ascii=False)
+    mapping: Dict[str, str] = {}
+    return json.loads(_UUID_RE.sub(lambda m: mapping.setdefault(m.group(0).upper(), str(uuid.uuid4()).upper()), text))
+
+
+def split_words(text: str, duration_us: int) -> List[Dict[str, Any]]:
+    """Evenly timed words (weighted by length) covering `duration_us`, as [{text, start, end}] in µs"""
+    words = text.split()
+    total = sum(len(w) for w in words) or 1
+    out, t = [], 0
+    for w in words:
+        d = duration_us * len(w) / total
+        out.append({"text": w, "start": int(t), "end": int(t + d)})
+        t += d
+    if out:
+        out[-1]["end"] = duration_us
+    return out
+
+
+def _words_json(words: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    """CapCut `words` block: ms offsets, with a zero-length space token between words"""
+    start, end, text = [], [], []
+    for i, w in enumerate(words):
+        s, e = int(w["start"] / 1000), int(w["end"] / 1000)
+        start.append(s), end.append(e), text.append(w["text"])
+        if i < len(words) - 1:
+            start.append(e), end.append(e), text.append(" ")
+    return {"start_time": start, "end_time": end, "text": text}
+
+
+def _set_text(text_material: Dict[str, Any], words: List[Dict[str, Any]]) -> None:
+    text = " ".join(w["text"] for w in words)
+    content = json.loads(text_material["content"])
+    length = len(text.encode("utf-16-le")) // 2
+    styles = content.get("styles") or [{}]
+    first = deepcopy(styles[0])
+    first["range"] = [0, length]
+    content["styles"] = [first]
+    content["text"] = text
+    text_material["content"] = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    text_material["words"] = _words_json(words)
+    text_material["current_words"] = {"start_time": [], "end_time": [], "text": []}
+    text_material["recognize_text"] = text
+    text_material["recognize_task_id"] = ""
+
+
+def _fit_animations(container: Dict[str, Any], duration_us: int) -> None:
+    for a in container.get("animations", []):
+        if a.get("type") in ("caption", "loop"):
+            a["start"], a["duration"] = 0, duration_us
+        elif a.get("type") == "out":
+            a["duration"] = min(a.get("duration", 0), duration_us)
+            a["start"] = duration_us - a["duration"]
+        elif a.get("type") == "in":
+            a["start"], a["duration"] = 0, min(a.get("duration", 0), duration_us)
+
+
+def build_caption(asset: Dict[str, Any], segment_template: Dict[str, Any], text: str, start_us: int,
+                  duration_us: int, words: Optional[List[Dict[str, Any]]] = None,
+                  y: Optional[float] = None, scale: Optional[float] = None):
+    """Caption segment from a caption/text template asset.
+
+    `words`: [{text, start, end}] in µs relative to the caption start (e.g. from
+    speech recognition); evenly timed from `text` when omitted. Multi-line
+    templates get the words split across their lines in order.
+    """
+    if asset["kind"] != "text_template":
+        raise ValueError(f"{asset['display_name']} is a {asset['kind']}, not a caption template")
+    bundle = _remap_uuids({"template": asset["template"], "deps": asset.get("dependencies", [])})
+    tpl, deps = bundle["template"], bundle["deps"]
+    by_id = {d["material"]["id"]: d["material"] for d in deps}
+    words = words or split_words(text, duration_us)
+
+    tirs = [r for r in tpl.get("text_info_resources", []) if r.get("text_material_id") in by_id]
+    if not tirs:
+        raise ValueError(f"{asset['display_name']}: template has no text material in the index")
+    per_line = max(1, -(-len(words) // len(tirs)))
+    refs: List[str] = []
+    for i, tir in enumerate(tirs):
+        chunk = words[i * per_line:(i + 1) * per_line] or words[-1:]
+        _set_text(by_id[tir["text_material_id"]], chunk)
+        attach = tir.setdefault("attach_info", {})
+        attach["start_time"], attach["duration"] = 0, duration_us
+        refs += [r for r in tir.get("extra_material_refs", []) if r not in refs]
+    tpl["text_info_resources"] = tirs
+    for m in by_id.values():
+        if m.get("type") == "sticker_animation":
+            _fit_animations(m, duration_us)
+
+    seg = deepcopy(segment_template)
+    seg["id"] = str(uuid.uuid4()).upper()
+    seg["material_id"] = tpl["id"]
+    seg["target_timerange"] = {"start": start_us, "duration": duration_us}
+    seg["extra_material_refs"] = refs
+    if y is not None:
+        seg["clip"]["transform"]["y"] = y
+    if scale is not None:
+        seg["clip"]["scale"] = {"x": scale, "y": scale}
+    materials = [("text_templates", tpl)] + [(d["list"], d["material"]) for d in deps]
+    return materials, seg
+
+
+def build_track_segment(asset: Dict[str, Any], segment_template: Dict[str, Any], start_us: int, duration_us: int,
+                        *, x: float = 0.0, y: float = 0.0, scale: Optional[float] = None,
+                        intensity: Optional[float] = None):
+    """Segment + material for a video effect, filter or sticker asset"""
+    kind = TRACK_KINDS.get(asset["kind"])
+    if kind not in MATERIAL_LISTS:
+        raise ValueError(f"{asset['display_name']} ({asset['kind']}) is not a video effect, filter or sticker")
+    material = instantiate(asset)
+    if intensity is not None and "value" in material:
+        material["value"] = intensity
+    seg = deepcopy(segment_template)
+    seg["id"] = str(uuid.uuid4()).upper()
+    seg["material_id"] = material["id"]
+    seg["target_timerange"] = {"start": start_us, "duration": duration_us}
+    if kind == "sticker" and isinstance(seg.get("clip"), dict):
+        seg["clip"]["transform"] = {"x": x, "y": y}
+        if scale is not None:
+            seg["clip"]["scale"] = {"x": scale, "y": scale}
+    return [(MATERIAL_LISTS[kind], material)], seg
